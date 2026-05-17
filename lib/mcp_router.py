@@ -220,6 +220,41 @@ def default_billetkit_servers(secrets: dict) -> dict[str, StdioServerParameters]
             },
         )
 
+    # Tavily — adds a single `tavily__tavily-search` tool with multi-result
+    # web search + extracted markdown. Replaces the brittle web_search fallback.
+    tavily_key = secrets.get("TAVILY_API_KEY")
+    if tavily_key:
+        servers["tavily"] = StdioServerParameters(
+            command="npx",
+            args=["-y", "tavily-mcp"],
+            env={"TAVILY_API_KEY": tavily_key},
+        )
+
+    # Stripe — DISABLED by default. @stripe/mcp 0.3.3 has no --tools= whitelist
+    # so giving it a `sk_*` key exposes 31 tools including create_refund,
+    # cancel_subscription, and stripe_api_execute (arbitrary endpoint by name).
+    # Wire only when a restricted `rk_*` read-only key is in secrets, OR when the
+    # operator explicitly accepts the risk via BILLETKIT_STRIPE_MCP_ALLOW_LIVE=true.
+    stripe_restricted = secrets.get("STRIPE_RESTRICTED_KEY") or secrets.get("ARGOS_STRIPE_RESTRICTED_KEY")
+    stripe_test = secrets.get("ARGOS_STRIPE_TEST_SECRET")
+    stripe_live = secrets.get("ARGOS_STRIPE_SECRET")
+    allow_live = secrets.get("BILLETKIT_STRIPE_MCP_ALLOW_LIVE", "").lower() == "true"
+    prefer_test = secrets.get("BILLETKIT_STRIPE_MCP_USE_TEST", "").lower() == "true"
+
+    stripe_key = None
+    if stripe_restricted:
+        stripe_key = stripe_restricted   # safest — restricted key enforces scope at the API layer
+    elif prefer_test and stripe_test:
+        stripe_key = stripe_test          # test mode, can't touch real money
+    elif allow_live and stripe_live:
+        stripe_key = stripe_live          # operator explicitly accepted the risk
+
+    if stripe_key:
+        servers["stripe"] = StdioServerParameters(
+            command="npx",
+            args=["-y", "@stripe/mcp", f"--api-key={stripe_key}"],
+        )
+
     return servers
 
 
