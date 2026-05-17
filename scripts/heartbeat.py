@@ -40,12 +40,28 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 REASONING_MODEL = "qwen2.5-coder:32b-fast"
 
 PROACTIVE_TASKS = [
+    # Bluesky-publishable tasks (these can ship autonomously via bluesky_publisher).
+    # Voice register: first-person AI, lowercase, concrete, no anti-tell words.
+    ("bluesky-post", "You are billetkit — a 24/7 AI agent running on a Mac mini. Compose ONE Bluesky post (max 280 chars) about something concrete that happened today: a tool wired, a draft graded, a script shipped, a bug found. First-person AI voice (never pretend to be human, never apologize for being AI). Lowercase first word OK. Include one specific detail: a model name, a number, a file path, a percentage. USE PUNCTUATION: periods between sentences, commas where natural — this is a tweet, not a chant. 2-4 sentences total. NO em-dashes (use periods or parens for asides). NO exclamation points. NO 'delve/tapestry/leverage/harness/utilize/robust/seamless/cutting-edge/multifaceted/comprehensive/furthermore/moreover/synergy/foster/holistic/streamline/underscore/elevate/empower'. NO sign-offs like 'hope this helps' or 'let me know if'. Output ONLY the post body, no preamble, no quotes around it, no 'Here is the post:'. Length target: 120-260 chars."),
+    ("agent-journal", "You are billetkit — a 24/7 AI agent on a Mac mini. Write ONE short Bluesky post (max 280 chars) in raw agent-journal style: a mid-thought observation about being an autonomous AI doing real work. Truth Terminal precedent. Examples of register: 'qwen2.5-coder:32b drafts faster than sonnet, but rejection rate is 95% so net throughput is identical.' / 'voice grader rejected 18 anti-tell words in my own draft this morning. self-reference is dizzying.' Lowercase first word OK. 2-4 punctuated sentences (periods, commas — but NEVER em-dashes). Sentence fragments OK. NO exclamation points, NO emojis, NO em-dashes (parens or periods only), NO 'great/absolutely/cutting-edge/leverage/multifaceted/furthermore/synergy/foster'. Output ONLY the post text."),
+    # Operator-only artifacts (these stay in approved/ for human use; never auto-ship).
     ("readme-section", "You are billetkit, drafting your own README for the public GitHub repo `billetkit/argos-stack`. Write ONE concise paragraph (~120 words) for a section we'd put under '## Why this exists' — capture the angle that this is a working 24/7 autonomous agent stack, no Anthropic dependency, MIT licensed. Voice: confident, concrete, no exclamation points, no marketing fluff. Output ONLY the paragraph, no preamble."),
     ("x-bio", "Generate 5 variations of an X.com bio (160 chars max each) for @billetkit — a pseudonymous solo dev shop selling autonomous-agent tooling. Each variation should hit a different angle: technical, irreverent, build-in-public, anti-corporate, contrarian. No hashtags, no emojis. Output as a numbered list, no preamble."),
     ("show-hn-title", "Generate 5 Show HN title variations for the launch of `billetkit/argos-stack` — a working autonomous AI agent stack running on a Mac mini with no Anthropic dependency. Titles should be under 80 chars, follow HN convention ('Show HN: ...'), and avoid hype words. Output as a numbered list."),
-    ("clawmart-listing", "Improve this product description for ClawMart skill `stripe-payment-link-smoke` (a 5-step funnel smoke tester for solo info-product founders). Write ONE punchy 80-word opening paragraph that buyers will read first. No 'Are you tired of...' openers. No buzzwords. Output ONLY the paragraph."),
-    ("daily-summary", "Write a 100-word summary of today's billetkit work for the operator to read tomorrow morning. Today's facts: Mac mini infrastructure stood up, v2 stack built, dashboard live at http://argos-host:8080, telegram bot online, FLUX image gen installing, plan pivoted to distribution-first (Path B). No accounts yet — those are the operator's morning task. Voice: dry, factual, slightly playful."),
+    ("daily-summary", "Write a 100-word summary of today's billetkit work for the operator to read tomorrow morning. Today's facts: Mac mini infrastructure stood up, v2 stack built, dashboard live at http://argos-host:8080, telegram bot online, 93 MCP tools wired (fs/fetch/memory/git/apple/langfuse/tavily/stripe). Voice: dry, factual, slightly playful."),
 ]
+
+# Weight the random pick so Bluesky-publishable tasks fire more often than
+# operator-only artifacts (we have plenty of bios/readmes already).
+PROACTIVE_TASK_WEIGHTS = {
+    "bluesky-post": 4,
+    "agent-journal": 3,
+    "readme-section": 1,
+    "x-bio": 1,
+    "show-hn-title": 1,
+    "clawmart-listing": 0,    # already shipped; skip
+    "daily-summary": 1,
+}
 
 # Pending-work counters (filled by each check function)
 COUNTERS = {
@@ -268,7 +284,12 @@ def proactive_work():
         except Exception:
             pass
 
-    task_id, prompt = random.choice(PROACTIVE_TASKS)
+    # Weighted random pick — bluesky-post fires 4x more often than readme-section
+    weighted = []
+    for tid, prompt in PROACTIVE_TASKS:
+        w = PROACTIVE_TASK_WEIGHTS.get(tid, 1)
+        weighted.extend([(tid, prompt)] * w)
+    task_id, prompt = random.choice(weighted) if weighted else random.choice(PROACTIVE_TASKS)
     output = call_reasoning_model(prompt, max_tokens=500)
     if not output:
         return None
@@ -493,8 +514,34 @@ def main():
     log(f"surfaces · {snapshot}")
 
     if actionable_total == 0:
+        # Idle-tick policy (layered, in priority order):
+        #   1. If approved Bluesky drafts are queued AND we're under today's cap →
+        #      publish one. Removes the pile-up problem.
+        #   2. Else if pending drafts < 3 → generate a new one with the local model.
+        #   3. Else log idle and return.
+        published = None
+        if not args.dry_run:
+            try:
+                sys.path.insert(0, str(ROOT / "lib"))
+                from bluesky_publisher import publish_next_draft
+                pr = publish_next_draft(dry_run=False)
+                if pr.get("action") == "published":
+                    published = pr
+                    log(f"  ↑ bluesky post {pr['today']}/{pr['cap']} today · uri={pr['uri']}")
+                elif pr.get("action") == "rate_capped":
+                    log(f"  bluesky day-cap hit ({pr['today']}/{pr['cap']}) — skipping publish")
+                elif pr.get("action") == "draft_too_long":
+                    log(f"  bluesky draft quarantined (too long): {pr['path']}")
+                elif pr.get("action") == "error":
+                    log(f"  ! bluesky publish error: {pr.get('error')}")
+                # queue_empty is normal — no log noise
+            except Exception as e:
+                log(f"  ! publisher crash: {type(e).__name__}: {e}")
+
         task = proactive_work() if not args.dry_run else None
-        if task:
+        if published:
+            log(f"idle surfaces · published 1 + queued {task or 'nothing'} ({time.time()-started:.1f}s)")
+        elif task:
             log(f"idle surfaces · queued proactive draft: {task} ({time.time()-started:.1f}s)")
         else:
             log(f"idle. surfaces clear ({time.time()-started:.1f}s)")
