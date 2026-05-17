@@ -73,6 +73,19 @@ TOOLS = [
             "required": ["script"]
         }
     },
+    {
+        "name": "web_search",
+        "description": "Search the live web via Tavily. Use for: looking up news/docs/announcements newer than your training cutoff, fact-checking claims, finding recent GitHub repos or HN posts, verifying URLs work, researching a specific question the operator asks. Returns top results with snippets. Don't use for filesystem questions or things you can answer from PLAN.md / CAPABILITIES.md.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query — be specific, include year/date keywords when freshness matters"},
+                "max_results": {"type": "integer", "description": "Number of results to return, default 5, max 10", "default": 5},
+                "search_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "basic=faster/cheaper, advanced=deeper crawl. Default basic.", "default": "basic"}
+            },
+            "required": ["query"]
+        }
+    },
 ]
 
 DENY_PATTERNS = [
@@ -158,6 +171,45 @@ def write_file_safe(path, content):
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def run_web_search(query, max_results=5, search_depth="basic"):
+    """Tavily web search. Returns ranked results with snippets."""
+    secrets = load_secrets()
+    api_key = secrets.get("TAVILY_API_KEY")
+    if not api_key:
+        return {"ok": False, "error": "TAVILY_API_KEY not configured"}
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": query,
+                "max_results": min(int(max_results or 5), 10),
+                "search_depth": search_depth if search_depth in ("basic", "advanced") else "basic",
+                "include_answer": True,
+                "include_raw_content": False,
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        # Compact the results so they fit in tool_result without blowing context
+        results = []
+        for item in data.get("results", [])[:int(max_results or 5)]:
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": (item.get("content") or "")[:600],
+                "score": item.get("score"),
+            })
+        return {
+            "ok": True,
+            "answer": data.get("answer"),  # Tavily's synthesized answer if available
+            "results": results,
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 def run_osascript(script):
     """Run AppleScript via osascript -e."""
     try:
@@ -188,6 +240,12 @@ def handle_tool_call(name, input_obj):
             return write_file_safe(input_obj["path"], input_obj["content"])
         elif name == "osascript":
             return run_osascript(input_obj["script"])
+        elif name == "web_search":
+            return run_web_search(
+                input_obj["query"],
+                max_results=input_obj.get("max_results", 5),
+                search_depth=input_obj.get("search_depth", "basic"),
+            )
         else:
             return {"ok": False, "error": f"unknown tool: {name}"}
     except Exception as e:
