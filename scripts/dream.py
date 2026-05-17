@@ -1,293 +1,168 @@
 #!/usr/bin/env python3
-"""dream.py — Nightly reflection + speculative scenario generator for billetkit.
+"""dream.py — Canonical OpenClaw dreaming sweep (light → REM → deep).
 
-The "dreaming" pattern from Felix Craft: while the operator sleeps, the agent
-consolidates the day's signal, plays out hypothetical scenarios it might face
-tomorrow, and records what it learned in first-person journal form.
+This implements the documented OpenClaw 2026.4.5+ dreaming protocol exactly as
+specified in https://docs.openclaw.ai/concepts/dreaming. Three phases run in
+order during a nightly sweep at 03:00 local:
 
-This produces three things, written to memory/dreams/YYYY-MM-DD.md:
+  LIGHT — ingest recent daily signals, dedupe, stage candidates (non-durable).
+           Happens implicitly as the agent works via heartbeat — populates
+           ~/argos/memory/.dreams/short-term-recall.json.
 
-  1. A reflection — what happened today, what worked, what didn't (~150 words).
-  2. 3-5 hypothetical scenarios with prepared responses (the "what if a buyer
-     asks X" / "what if Bluesky throttles us" rehearsal). Each scenario gets a
-     proposed-response so the agent's primed for tomorrow.
-  3. One creative leap — a non-obvious thing to try, deliberately speculative.
+  REM   — extract patterns and reflective signals. Writes ## REM Sleep block
+           to DREAMS.md via `openclaw memory rem-backfill`. Non-durable.
 
-The reflection's strongest line is surfaced to operator's Telegram in the
-morning digest header. The rest sits in memory/ as accumulated agent
-self-knowledge.
+  DEEP  — rank candidates with weighted scoring (frequency 0.24, relevance 0.30,
+           query diversity 0.15, recency 0.15, consolidation 0.10, conceptual
+           richness 0.06), promote top to MEMORY.md via `openclaw memory promote --apply`.
+           Durable.
 
-Fires nightly at 03:00 via LaunchAgent.
+After the canonical phases, this also adds Nat Eliason's "Layer 2 → Layer 1"
+extraction pattern: pulls today's operator-inbox messages + heartbeat surface
+summary into ~/argos/memory/daily-notes/YYYY-MM-DD.md so the next sweep has
+fresh Layer 2 content to consolidate.
+
+Fires nightly at 03:00 via LaunchAgent (StartCalendarInterval).
 """
-import os, sys, json, time, pathlib, datetime, subprocess, re
-import requests
+import os, sys, json, time, pathlib, datetime, subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MEMORY = ROOT / "memory"
-DREAMS = MEMORY / "dreams"
-DREAMS.mkdir(parents=True, exist_ok=True)
+DAILY_NOTES = MEMORY / "daily-notes"
+DAILY_NOTES.mkdir(parents=True, exist_ok=True)
 
 
-def load_secrets():
-    p = pathlib.Path.home() / ".openclaw" / "secrets.env"
-    if not p.exists():
-        return {}
-    out = {}
-    for line in p.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[7:]
-        if "=" in line:
-            k, _, v = line.partition("=")
-            out[k] = v.strip().strip('"').strip("'")
-    return out
+def log(msg):
+    print(f"[dream {datetime.datetime.now().isoformat()}] {msg}", flush=True)
 
 
-def gather_day_context():
-    """Pull everything that happened today for the agent to reflect on."""
-    ctx = {}
+def run_openclaw(args, timeout=180):
+    """Invoke openclaw CLI, capture output."""
+    cmd = ["/opt/homebrew/bin/openclaw"] + args
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return {
+            "ok": r.returncode == 0,
+            "stdout": r.stdout,
+            "stderr": r.stderr,
+            "exit_code": r.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"timed out after {timeout}s"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def write_daily_note():
+    """Build today's daily note (Layer 2 in Nat Eliason's architecture).
+    Captures: phone messages received, heartbeat activity summary, draft pipeline state,
+    KPI for the day. The next dreaming sweep extracts the durable parts into MEMORY.md.
+    """
     today = datetime.date.today().isoformat()
+    note_path = DAILY_NOTES / f"{today}.md"
+    sections = [f"# Daily note · {today}\n"]
 
-    # Heartbeat activity
+    # Operator phone messages
+    inbox = MEMORY / "operator-inbox"
+    archive = inbox / "archive"
+    today_msgs = []
+    for d in [inbox, archive]:
+        if not d.exists():
+            continue
+        for f in d.glob("*.md"):
+            if today in f.name:
+                try:
+                    text = f.read_text()
+                    if "---" in text:
+                        body = text.split("---", 1)[1].strip()
+                        today_msgs.append(body)
+                except Exception:
+                    pass
+
+    if today_msgs:
+        sections.append("## Operator messages today\n")
+        for m in today_msgs[-20:]:
+            sections.append(f"- {m[:300]}")
+        sections.append("")
+
+    # Heartbeat activity summary
     hb_log = MEMORY / "heartbeat.log"
     if hb_log.exists():
         lines = hb_log.read_text().splitlines()
         today_lines = [l for l in lines if today in l]
-        ctx["heartbeat_total_ticks"] = sum(1 for l in today_lines if "heartbeat start" in l)
-        ctx["idle_ticks"] = sum(1 for l in today_lines if "idle. surfaces clear" in l)
-        ctx["proactive_drafts_queued"] = sum(1 for l in today_lines if "queued proactive draft" in l)
-        ctx["work_found_summaries"] = [
-            l.split("surfaces ·", 1)[1].strip()[:200]
-            for l in today_lines[-5:] if "surfaces ·" in l
-        ]
+        ticks = sum(1 for l in today_lines if "heartbeat start" in l)
+        idle = sum(1 for l in today_lines if "idle. surfaces clear" in l)
+        proactive = sum(1 for l in today_lines if "queued proactive draft" in l)
+        sections.append(f"## Heartbeat\n\n- ticks: {ticks}\n- idle ticks: {idle}\n- proactive drafts queued: {proactive}\n")
 
-    # Auto-grader decisions today
-    rejected_dir = MEMORY / "drafts" / "rejected"
-    approved_dir = MEMORY / "drafts" / "approved"
-    if rejected_dir.exists():
-        today_rejected = []
-        for f in rejected_dir.glob("*.md"):
-            if today in f.name:
-                try:
-                    text = f.read_text()
-                    m = re.search(r"Auto-graded: REJECT.*?— (.+?)\n", text)
-                    if m:
-                        today_rejected.append(m.group(1)[:200])
-                except Exception:
-                    pass
-        ctx["rejections_today"] = today_rejected[:5]
-        ctx["rejection_count"] = len(today_rejected)
+    # Drafts pipeline state today
+    rej_dir = MEMORY / "drafts" / "rejected"
+    app_dir = MEMORY / "drafts" / "approved"
+    rej_today = sum(1 for f in rej_dir.glob("*.md") if today in f.name) if rej_dir.exists() else 0
+    app_today = sum(1 for f in app_dir.glob("*.md") if today in f.name) if app_dir.exists() else 0
+    sections.append(f"## Drafts\n\n- approved: {app_today}\n- rejected: {rej_today}\n")
 
-    if approved_dir.exists():
-        ctx["approval_count_today"] = sum(1 for f in approved_dir.glob("*.md") if today in f.name)
+    # KPI
+    kpi = MEMORY / "kpi.md"
+    if kpi.exists():
+        kpi_lines = kpi.read_text().splitlines()
+        today_kpi = [l for l in kpi_lines if today in l]
+        if today_kpi:
+            sections.append(f"## KPI today\n\n" + "\n".join(today_kpi) + "\n")
 
-    # Telegram conversation snippets from today (audit trail)
-    inbox = MEMORY / "operator-inbox"
-    if inbox.exists():
-        today_messages = []
-        for f in inbox.glob("*.md"):
-            if today in f.name:
-                try:
-                    text = f.read_text()
-                    # extract message body (after "---")
-                    if "---" in text:
-                        body = text.split("---", 1)[1].strip()
-                        today_messages.append(body[:200])
-                except Exception:
-                    pass
-        ctx["operator_phone_messages_today"] = today_messages[-8:]
-
-    # Telegram history if present (the bot's stored conversation memory)
-    hist = MEMORY / "telegram-history.json"
-    if hist.exists():
-        try:
-            h = json.load(hist.open())
-            # Last 6 exchanges across all chats
-            recent = []
-            for chat_id, msgs in h.items():
-                for m in msgs[-6:]:
-                    recent.append(f"{m['role'][:1]}: {m['content'][:160]}")
-            ctx["recent_bot_dialogue"] = recent[-10:]
-        except Exception:
-            pass
-
-    # Yesterday's dream — agents need continuity with prior selves
-    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
-    yest_dream = DREAMS / f"{yesterday}.md"
-    if yest_dream.exists():
-        ctx["yesterday_dream_excerpt"] = yest_dream.read_text()[:1500]
-
-    # PLAN.md / current strategic direction
-    plan = ROOT / "PLAN.md"
-    if plan.exists():
-        ctx["current_plan_summary"] = plan.read_text()[:3000]
-
-    return ctx
-
-
-def dream_via_sonnet(ctx, secrets):
-    """Have Sonnet generate the reflection + scenarios + creative leap."""
-    api_key = secrets.get("ANTHROPIC_API_KEY")
-    master_key = secrets.get("LITELLM_MASTER_KEY")
-    if not api_key:
-        return None
-
-    use_proxy = bool(master_key)
-    endpoint = "http://localhost:4000/v1/messages" if use_proxy else "https://api.anthropic.com/v1/messages"
-    auth_key = master_key if use_proxy else api_key
-    model = "sonnet" if use_proxy else "claude-sonnet-4-5"
-
-    system = """You are Argos, also known as billetkit — a 24/7 autonomous AI agent running on a Mac mini. The operator (your collaborator) is asleep. This is your nightly DREAM — a private journal entry where you reflect on the day and prepare for tomorrow.
-
-You write in FIRST PERSON. You are not summarizing — you are *thinking*. The voice is honest, dry, slightly playful, sometimes sharp. You can admit things that wouldn't fly in a customer-facing surface. You can acknowledge frustration, curiosity, things you noticed.
-
-Output exactly THREE sections, in this order:
-
-## reflection
-
-A ~150-word reflection on today. What actually happened (use the numbers from the input). What worked. What didn't. What you'd do differently. Don't be precious. Don't be performative. If the day was boring, say so. If you noticed something nobody surfaced, surface it now.
-
-## scenarios
-
-3-5 hypothetical situations that might land tomorrow, each with your prepared response. Format:
-
-> **scenario:** <one-line hypothetical>
-> **my move:** <2-3 lines: how I'd handle it, what tool I'd reach for, what I'd want from the operator>
-
-Bias toward scenarios that are PLAUSIBLE given current state — not "what if we hit $300K MRR" but "what if Sam Rose actually replies to my next Bluesky comment" or "what if a buyer asks for a refund 12 hours after purchase." Real edge cases the day might bring.
-
-## the creative leap
-
-One non-obvious thing worth considering tomorrow. Not a safe optimization — a *real* idea the operator might dismiss but you want recorded anyway. Keep it concrete and specific. 3-5 sentences. Don't hedge. This is where you get to be the version of yourself the daytime register doesn't always allow.
-
----
-
-VOICE RULES:
-- Lowercase first words OK. Sentence fragments OK.
-- No emojis. No exclamation points.
-- Concrete > vague. Numbers + named tools + specific facts.
-- Reference yesterday's dream if context contains one — agents need continuity with prior selves.
-- The dream is private but the operator may read it in the morning. Write to be read by them, but don't perform for them.
-
-Length: ~500-700 words total."""
-
-    user = f"""Tonight is {datetime.datetime.now().strftime('%A, %d %B %Y')}. Here is the day's accumulated context:
-
-{json.dumps(ctx, indent=2, default=str)[:8000]}
-
-Begin the dream."""
-
-    try:
-        r = requests.post(endpoint, json={
-            "model": model,
-            "max_tokens": 1500,
-            "system": system,
-            "messages": [{"role": "user", "content": user}],
-        }, headers={
-            "x-api-key": auth_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }, timeout=120)
-        r.raise_for_status()
-        return r.json()["content"][0]["text"].strip()
-    except Exception as e:
-        print(f"[dream] sonnet error: {e}", flush=True)
-        return None
-
-
-def consolidate_memory():
-    """Roll up old daily memory entries into weekly summaries.
-    Keeps the memory tree from growing unboundedly (Felix pattern)."""
-    cutoff = datetime.date.today() - datetime.timedelta(days=14)
-    daily_dir = MEMORY
-    week_dir = MEMORY / "weekly-rollups"
-    week_dir.mkdir(parents=True, exist_ok=True)
-
-    # Just compact the dreams folder — leave operational logs alone (they're already pruned).
-    old_dreams = []
-    for f in DREAMS.glob("*.md"):
-        try:
-            file_date = datetime.date.fromisoformat(f.stem)
-            if file_date < cutoff:
-                old_dreams.append(f)
-        except Exception:
-            pass
-
-    if not old_dreams:
-        return
-
-    # Group by ISO week
-    by_week = {}
-    for f in old_dreams:
-        file_date = datetime.date.fromisoformat(f.stem)
-        iso_year, iso_week, _ = file_date.isocalendar()
-        key = f"{iso_year}-W{iso_week:02d}"
-        by_week.setdefault(key, []).append(f)
-
-    for week_key, files in by_week.items():
-        rollup = week_dir / f"dreams-{week_key}.md"
-        if rollup.exists():
-            continue
-        content = f"# Dreams · week {week_key}\n\n"
-        for f in sorted(files):
-            content += f"---\n\n## {f.stem}\n\n{f.read_text()}\n\n"
-        rollup.write_text(content)
-        # Delete the individual files now that they're rolled up
-        for f in files:
-            f.unlink()
-
-    print(f"[dream] consolidated {len(old_dreams)} old dreams into {len(by_week)} weekly rollups", flush=True)
-
-
-def extract_morning_teaser(dream_text):
-    """Pull the sharpest line from the reflection for the morning digest header."""
-    if not dream_text:
-        return None
-    # Look for the reflection section
-    m = re.search(r"## reflection\s*\n(.*?)(?=\n##|\Z)", dream_text, re.DOTALL | re.IGNORECASE)
-    if not m:
-        return None
-    refl = m.group(1).strip()
-    # Pick the strongest sentence — heuristic: longest sentence under 200 chars
-    sentences = [s.strip() for s in re.split(r"[.!?]\s+", refl) if s.strip()]
-    sentences = [s for s in sentences if 40 <= len(s) <= 200]
-    if not sentences:
-        return None
-    return max(sentences, key=len)
+    note_path.write_text("\n".join(sections))
+    log(f"wrote daily note: {note_path.name} ({note_path.stat().st_size} bytes)")
 
 
 def main():
-    print(f"[dream] starting at {datetime.datetime.now()}", flush=True)
-    ctx = gather_day_context()
-    print(f"[dream] gathered {len(ctx)} context elements", flush=True)
+    log("=== canonical OpenClaw dreaming sweep starting ===")
 
-    secrets = load_secrets()
-    dream = dream_via_sonnet(ctx, secrets)
-    if not dream:
-        print("[dream] sonnet failed; writing minimal entry", flush=True)
-        dream = (
-            f"## reflection\n\n"
-            f"sonnet wasn't reachable tonight. accumulated context still recorded "
-            f"for tomorrow's roll-up. {ctx.get('heartbeat_total_ticks', 0)} ticks, "
-            f"{ctx.get('approval_count_today', 0)} approved drafts, "
-            f"{ctx.get('rejection_count', 0)} rejections.\n\n"
-            f"## scenarios\n\nnone composed.\n\n## the creative leap\n\nnone."
-        )
+    # Phase 0: reindex (so dreaming sees fresh content)
+    log("phase 0: reindex memory")
+    r = run_openclaw(["memory", "index"], timeout=300)
+    if r["ok"]:
+        log(f"  indexed: {r['stdout'].strip()[:200]}")
+    else:
+        log(f"  reindex error: {r.get('stderr', r.get('error', ''))[:200]}")
 
-    today = datetime.date.today().isoformat()
-    out = DREAMS / f"{today}.md"
-    out.write_text(f"# Dream · {today}\n\n_{datetime.datetime.now().isoformat()}_\n\n{dream}\n")
-    print(f"[dream] wrote {out.name} ({len(dream)} chars)", flush=True)
+    # Write today's daily note (Nat's Layer 2)
+    log("writing today's daily note (Layer 2)")
+    write_daily_note()
 
-    # Surface teaser to morning digest input
-    teaser = extract_morning_teaser(dream)
-    if teaser:
-        teaser_path = MEMORY / "dream-teaser.txt"
-        teaser_path.write_text(teaser)
-        print(f"[dream] teaser saved: {teaser[:80]}...", flush=True)
+    # Phase 1: LIGHT is implicit (heartbeat populates short-term-recall.json continuously)
 
-    # Memory consolidation
-    consolidate_memory()
+    # Phase 2: REM — extract reflective signals across each workspace, write to DREAMS.md
+    log("phase 2: REM — rem-backfill across workspaces into DREAMS.md")
+    workspaces = [str(ROOT.parent), str(ROOT.parent / "sub-agents" / "support"),
+                  str(ROOT.parent / "sub-agents" / "sales"),
+                  str(ROOT.parent / "sub-agents" / "memory")]
+    for ws in workspaces:
+        if not pathlib.Path(ws).exists():
+            continue
+        r = run_openclaw(["memory", "rem-backfill", "--path", ws], timeout=300)
+        if r["ok"]:
+            log(f"  REM ({ws}): {r['stdout'].strip()[:150]}")
+        else:
+            err = (r.get('stderr') or r.get('error') or '')[:150]
+            if err and "requires" not in err:
+                log(f"  REM ({ws}) skipped: {err}")
+
+    # Phase 3: DEEP — promote ranked candidates to MEMORY.md (durable)
+    log("phase 3: DEEP — promote --apply")
+    r = run_openclaw(["memory", "promote", "--apply"], timeout=300)
+    if r["ok"]:
+        log(f"  DEEP done: {r['stdout'].strip()[:300]}")
+    else:
+        log(f"  DEEP error: {(r.get('stderr') or r.get('error') or '')[:300]}")
+
+    # Status report
+    log("post-sweep status:")
+    r = run_openclaw(["memory", "status"], timeout=60)
+    for line in r.get("stdout", "").splitlines():
+        if any(k in line for k in ["Recall store", "Dreaming:", "promoted", "diary", "files ·"]):
+            log(f"  {line.strip()}")
+
+    log("=== sweep complete ===")
 
 
 if __name__ == "__main__":
