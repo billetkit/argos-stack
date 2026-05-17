@@ -23,6 +23,24 @@ Required env (from ~/.openclaw/secrets.env):
 import os, json, time, pathlib, datetime, sys, traceback, subprocess, re, shlex
 import requests
 
+# ---------- MCP ROUTER (lazy-booted at startup, optional) ----------
+# Adds 57+ tools from 6 stdio MCP servers (fs/fetch/memory/git/apple/langfuse)
+# behind the namespaced `serverkey__toolname` convention. If boot fails the bot
+# keeps running with the native 5-tool set.
+_THIS_DIR = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_THIS_DIR.parent / "lib"))
+try:
+    from mcp_router import MCPRouter, default_billetkit_servers
+    _MCP_IMPORT_OK = True
+except Exception as _e:
+    MCPRouter = None  # type: ignore
+    default_billetkit_servers = None  # type: ignore
+    _MCP_IMPORT_OK = False
+    _MCP_IMPORT_ERR = _e
+
+MCP_ROUTER = None  # set inside main() after secrets are loaded
+
+
 # ---------- TOOL DEFINITIONS (sent to Anthropic API on each call) ----------
 
 TOOLS = [
@@ -246,6 +264,13 @@ def handle_tool_call(name, input_obj):
                 max_results=input_obj.get("max_results", 5),
                 search_depth=input_obj.get("search_depth", "basic"),
             )
+        elif "__" in name and MCP_ROUTER is not None:
+            # MCP tool — namespaced as serverkey__toolname
+            r = MCP_ROUTER.call_tool(name, input_obj or {}, timeout=60.0)
+            return {
+                "ok": r.get("ok", False),
+                "content": (r.get("content") or "")[:8000],
+            }
         else:
             return {"ok": False, "error": f"unknown tool: {name}"}
     except Exception as e:
@@ -345,6 +370,17 @@ TOOLS YOU HAVE (USE THEM — DO NOT JUST TALK):
 - `read_file` — read files under ~/argos/, ~/.openclaw/, /tmp/. Use to surface log content, configs, scripts, drafts.
 - `write_file` — write under ~/argos/v2/memory/, ~/argos/v2/docs/drafts/, /tmp/ only. Use to save drafts the operator can later approve.
 - `osascript` — AppleScript on the mini. Use for `display dialog "..."`, `display notification "..."`, opening URLs on the TV. Renders to the connected display.
+- `web_search` — Tavily search when you need fresh information from the live web.
+
+MCP TOOLS (namespaced `<server>__<tool>` — prefer these over bash for the same job):
+- `fs__*` — sandboxed file I/O under ~/argos. 14 tools: read_text_file, write_file, edit_file, list_directory, directory_tree, search_files, get_file_info, etc. Use these instead of `bash cat` / `bash ls`.
+- `git__*` — git ops on /tmp/argos-stack (the public billetkit/argos-stack repo). 12 tools: git_status, git_diff, git_log, git_commit, git_add, git_branch, git_create_branch. Use to inspect history or stage changes to the public stack.
+- `memory__*` — persistent knowledge graph (entities/relations/observations). 9 tools: create_entities, add_observations, search_nodes, read_graph. Use to record stable facts you'll want to recall later — operator preferences, decisions, sub-agent designs.
+- `fetch__fetch` — HTTP GET with markdown extraction. Better than `bash curl` when you want clean text content from an article/doc.
+- `apple__*` — native macOS via EventKit. 7 surfaces: contacts, notes, messages, mail, reminders, calendar, maps. Use for "schedule X for tomorrow", "remind me about Y", "what's on my calendar today".
+- `langfuse__*` — query our self-hosted Langfuse for trace/dataset analysis. 14 tools: list_traces, analyze_trace, compare_traces, list_datasets. Use to inspect what the bot/agents have been doing.
+
+When the same action can be done via native or MCP, prefer MCP — it's structured, auditable, and goes through dedicated servers.
 
 POLICY ON TOOLS:
 - When the operator says "do X", USE TOOLS to do X. Do not say "queued for next session" if you can do it right now via bash/osascript.
@@ -417,13 +453,17 @@ def chat_with_anthropic(messages, api_key, system_prompt):
     system_blocks = [
         {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
     ]
+    # Merge MCP-provided tools with the native 5. MCP tools are namespaced (serverkey__name)
+    # so they can't collide with bash/read_file/write_file/osascript/web_search.
+    mcp_tools = MCP_ROUTER.as_anthropic_tools() if MCP_ROUTER is not None else []
+    all_tools = TOOLS + mcp_tools
     for turn in range(max_turns):
         try:
             r = requests.post(endpoint, json={
                 "model": "sonnet" if use_proxy else "claude-sonnet-4-5",
                 "max_tokens": 1024,
                 "system": system_blocks,
-                "tools": TOOLS,
+                "tools": all_tools,
                 "messages": current,
             }, headers=auth_headers, timeout=120)
             r.raise_for_status()
@@ -436,7 +476,7 @@ def chat_with_anthropic(messages, api_key, system_prompt):
                     "model": "sonnet" if use_proxy else "claude-sonnet-4-5",
                     "max_tokens": 1024,
                     "system": system_prompt,
-                    "tools": TOOLS,
+                    "tools": all_tools,
                     "messages": current,
                 }, headers=auth_headers, timeout=120)
                 r.raise_for_status()
@@ -586,6 +626,7 @@ def send_typing(api, chat_id):
 
 
 def main():
+    global MCP_ROUTER
     log("telegram-bot v2 starting (real-time)")
     secrets = load_secrets()
     token = secrets.get("BILLETKIT_BOT_TOKEN")
@@ -595,6 +636,25 @@ def main():
         time.sleep(30)
         secrets = load_secrets()
         token = secrets.get("BILLETKIT_BOT_TOKEN")
+
+    # Boot the MCP router once at startup. Daemon-thread keeps the 6 stdio
+    # servers alive for the bot's lifetime. Failure here is non-fatal — the bot
+    # falls back to the native 5-tool set.
+    if not _MCP_IMPORT_OK:
+        log(f"mcp router import failed: {_MCP_IMPORT_ERR} — continuing without MCP tools")
+    elif secrets.get("BILLETKIT_DISABLE_MCP", "").lower() == "true":
+        log("mcp router disabled via BILLETKIT_DISABLE_MCP=true")
+    else:
+        try:
+            log("booting mcp router (6 stdio servers)...")
+            MCP_ROUTER = MCPRouter(default_billetkit_servers(secrets))
+            MCP_ROUTER.wait_until_ready(timeout=90)
+            inv = MCP_ROUTER.tool_inventory()
+            tool_total = sum(len(t) for t in inv.values())
+            log(f"  ✓ mcp router up: {tool_total} tools across {len(inv)} servers — {list(inv.keys())}")
+        except Exception as e:
+            log(f"  ! mcp router boot failed: {type(e).__name__}: {e} — continuing without MCP tools")
+            MCP_ROUTER = None
 
     api = f"https://api.telegram.org/bot{token}"
 
