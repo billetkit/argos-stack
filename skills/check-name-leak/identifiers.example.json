@@ -1,0 +1,51 @@
+{
+  "_comment": "Copy to ~/.config/check-name-leak/identifiers.json and fill in your own. This file is the schema example only — DO NOT put real identifiers in this file.",
+
+  "names": [
+    "Your Legal Name",
+    "Legal Name",
+    "Nickname",
+    "LegalName"
+  ],
+
+  "schools": [
+    "Your University",
+    "University Initialism",
+    "your-university"
+  ],
+
+  "employers": [
+    "Current Employer",
+    "Previous Employer",
+    "employer-handle"
+  ],
+
+  "cities": [
+    "Your City",
+    "City Abbreviation"
+  ],
+
+  "custom_patterns": [
+    "your-personal-email@gmail\\.com",
+    "your-github-handle"
+  ],
+
+  "scan_dirs": [
+    "./products",
+    "./site",
+    "./launch",
+    "./blog",
+    "./pdf"
+  ],
+
+  "extensions": ["md", "html", "txt", "json", "yaml", "yml"],
+
+  "exclude_globs": [
+    "node_modules",
+    ".git",
+    "*.bak",
+    "memory/archive/**"
+  ],
+
+  "max_file_size_kb": 500
+}

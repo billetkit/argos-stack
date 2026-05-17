@@ -1,0 +1,27 @@
+# Machine-local plists (paths are user-specific, often contain creds)
+scripts/*.plist
+*.plist.bak
+
+# Anthropic / HF / API tokens
+.env
+secrets.env
+.openclaw/
+
+# Dynamic state
+memory/heartbeat*.log
+memory/operator-inbox/
+memory/operator-outbox/
+memory/drafts/
+memory/telegram-*
+memory/dashboard-*
+memory/img-server*
+memory/last-*.txt
+memory/last-*.json
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
+
+# Image generation outputs
+/tmp/img-*.png

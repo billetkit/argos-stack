@@ -1,0 +1,26 @@
+{
+  "_comment": "Copy to your project root as stripe-smoke.json (gitignore-safe).",
+
+  "site_base": "https://yourdomain.com",
+
+  "products": [
+    {
+      "slug": "how-to-hire-an-ai",
+      "landing_url": "/how-to-hire-an-ai/",
+      "thanks_url": "/how-to-hire-an-ai/thanks/",
+      "download_extensions": ["pdf"],
+      "_description": "PDF info product. Landing → Stripe → Thanks → /download/file.pdf"
+    },
+    {
+      "slug": "agent-starter-kit",
+      "landing_url": "/agent-starter-kit/",
+      "thanks_url": "/agent-starter-kit/thanks/",
+      "download_extensions": ["zip", "pdf"],
+      "_description": "Bundle. Thanks page should link to both a zip AND a pdf."
+    }
+  ],
+
+  "timeout_seconds": 15,
+  "allow_redirects": true,
+  "_notes": "expected_status defaults to 200 for all steps. download_extensions is a list of file extensions to look for on the thanks page; the first match per extension is checked. If a product is video-based, use ['mp4'] or ['m4v']."
+}
