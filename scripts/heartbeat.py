@@ -50,6 +50,8 @@ PROACTIVE_TASKS = [
 # Pending-work counters (filled by each check function)
 COUNTERS = {
     "operator_inbox": 0,
+    "github_stars": 0,
+    "github_issues": 0,
     "clawmart_inbox": 0,
     "bluesky_mentions": 0,
     "bluesky_reply_queue": 0,
@@ -80,6 +82,35 @@ def check_operator_inbox():
     return len(list(p.glob("*.md")))
 
 
+def check_github(verbose=False):
+    """Pull repo signal from GitHub: stars, open issues, open PRs."""
+    secrets = parse_secrets()
+    pat = secrets.get("BILLETKIT_GITHUB_PAT")
+    handle = secrets.get("BILLETKIT_GITHUB_HANDLE", "billetkit")
+    if not pat:
+        return {"stars": 0, "issues": 0, "prs": 0}
+
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{handle}/argos-stack",
+            headers={"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return {"stars": 0, "issues": 0, "prs": 0}
+        d = r.json()
+        return {
+            "stars": d.get("stargazers_count", 0),
+            "issues": d.get("open_issues_count", 0),
+            "prs": 0,  # open_issues_count includes PRs; we'd need a separate call
+            "forks": d.get("forks_count", 0),
+            "watchers": d.get("subscribers_count", 0),
+        }
+    except Exception as e:
+        if verbose: log(f"  github check failed: {e}")
+        return {"stars": 0, "issues": 0, "prs": 0}
+
+
 def check_clawmart_inbox():
     """Stub: ClawMart API integration pending account creation.
     Once the seller account exists, this hits the seller-inbox endpoint."""
@@ -94,7 +125,8 @@ def check_bluesky_mentions(verbose=False):
     """Pull unread notifications via atproto. Count mentions + replies addressed to us."""
     try:
         from atproto import Client
-    except ImportError:
+    except Exception as e:
+        if verbose: log(f"  bluesky check skipped: {type(e).__name__}: {e}")
         return 0
 
     creds = parse_secrets()
@@ -248,6 +280,111 @@ def proactive_work():
     return task_id
 
 
+def auto_grade_drafts(verbose=False):
+    """Grade every ungraded draft in v2/memory/drafts/ via Claude Sonnet.
+    Moves to approved/ or rejected/ subdirs, leaves only ESCALATE in drafts/."""
+    if not DRAFTS.exists():
+        return {"graded": 0, "approved": 0, "rejected": 0, "escalated": 0, "errors": 0}
+
+    secrets = parse_secrets()
+    api_key = secrets.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {"graded": 0, "error": "no ANTHROPIC_API_KEY"}
+
+    approved_dir = DRAFTS / "approved"
+    rejected_dir = DRAFTS / "rejected"
+    approved_dir.mkdir(exist_ok=True)
+    rejected_dir.mkdir(exist_ok=True)
+
+    counts = {"graded": 0, "approved": 0, "rejected": 0, "escalated": 0, "errors": 0}
+    rubric = """You are a quality grader for billetkit's autonomous content pipeline. Read the draft and return ONE of three verdicts:
+
+APPROVE — ready to ship without operator review. Hits voice rules (no AI tells, no exclamation, concrete > vague, original phrasing).
+REJECT — has obvious AI tells, banned phrases, generic copywriting, or doesn't match brand voice.
+ESCALATE — borderline, contains a strategic decision (pricing, scope), needs operator judgement.
+
+BILLETKIT VOICE RULES:
+- No exclamation points. No emojis. No "great", "absolutely", "I'd be happy", "let me know", "feel free", "cutting-edge", "empower", "unleash", "leverage", "synergy".
+- Lowercase first words OK. Sentence fragments OK.
+- Concrete > vague: numbers, specific tool/repo names, dollar amounts. NOT "modern tech enthusiast" or "build better code".
+- Original phrasing — no rehashing common LLM clichés.
+- Confident, slightly playful, no hedging.
+- Reads like Sam Rose / Patio11 / Pieter Levels.
+
+Respond with ONLY valid JSON, no preamble:
+{"verdict": "APPROVE" | "REJECT" | "ESCALATE", "reason": "one sentence", "confidence": 0.0-1.0}"""
+
+    for path in sorted(DRAFTS.glob("*.md")):
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text()
+        except Exception:
+            counts["errors"] += 1
+            continue
+
+        # Call Sonnet — route via LiteLLM proxy for cost tracking + Langfuse traces
+        use_proxy = secrets.get("BILLETKIT_USE_LITELLM", "true").lower() == "true"
+        master_key = secrets.get("LITELLM_MASTER_KEY", "")
+        if use_proxy and master_key:
+            endpoint = "http://localhost:4000/v1/messages"
+            auth_key = master_key
+        else:
+            endpoint = "https://api.anthropic.com/v1/messages"
+            auth_key = api_key
+        try:
+            # Auto-grading is short classification — Haiku handles it at 5-25x lower cost than Sonnet.
+            # Same rubric, same grade quality for this kind of bounded judgement task.
+            model_name = "haiku" if use_proxy and master_key else "claude-haiku-4-5"
+            r = requests.post(endpoint, json={
+                "model": model_name,
+                "max_tokens": 300,
+                "system": rubric,
+                "messages": [{"role": "user", "content": f"Draft to grade:\n\n{content}"}],
+            }, headers={
+                "x-api-key": auth_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }, timeout=60)
+            r.raise_for_status()
+            resp_text = r.json()["content"][0]["text"].strip()
+            # Strip markdown code fences if present
+            resp_text = re.sub(r"^```(?:json)?\s*", "", resp_text)
+            resp_text = re.sub(r"\s*```$", "", resp_text)
+            verdict_data = json.loads(resp_text)
+            verdict = verdict_data.get("verdict", "ESCALATE").upper()
+            reason = verdict_data.get("reason", "")
+            confidence = verdict_data.get("confidence", 0.5)
+        except Exception as e:
+            if verbose: log(f"  grade error on {path.name}: {e}")
+            counts["errors"] += 1
+            continue
+
+        counts["graded"] += 1
+
+        # Apply verdict
+        decision_note = f"\n\n---\n_Auto-graded: {verdict} ({confidence:.2f}) — {reason}_\n"
+        if verdict == "APPROVE":
+            new_content = content + decision_note
+            dest = approved_dir / path.name
+            dest.write_text(new_content)
+            path.unlink()
+            counts["approved"] += 1
+            if verbose: log(f"  ✓ approved: {path.name} — {reason}")
+        elif verdict == "REJECT":
+            new_content = content + decision_note
+            dest = rejected_dir / path.name
+            dest.write_text(new_content)
+            path.unlink()
+            counts["rejected"] += 1
+            if verbose: log(f"  ✗ rejected: {path.name} — {reason}")
+        else:  # ESCALATE — leave in drafts/
+            counts["escalated"] += 1
+            if verbose: log(f"  ? escalated: {path.name} — {reason}")
+
+    return counts
+
+
 def handle_new_sale(verbose=False):
     """A stranger paid. Update KPI."""
     today = datetime.date.today().isoformat()
@@ -274,6 +411,9 @@ def main():
     log(f"--- heartbeat start (dry-run={args.dry_run}) ---")
 
     COUNTERS["operator_inbox"] = check_operator_inbox()
+    gh = check_github(args.verbose)
+    COUNTERS["github_stars"] = gh.get("stars", 0)
+    COUNTERS["github_issues"] = gh.get("issues", 0)
     COUNTERS["clawmart_inbox"] = check_clawmart_inbox()
     COUNTERS["bluesky_mentions"] = check_bluesky_mentions(args.verbose)
     COUNTERS["bluesky_reply_queue"] = check_reply_queue()
@@ -284,12 +424,23 @@ def main():
     # it shouldn't block proactive work. Only "actionable" surfaces count toward idle/busy.
     actionable_keys = ["clawmart_inbox", "bluesky_mentions", "bluesky_reply_queue", "stripe_new_sales", "intents_pending"]
     actionable_total = sum(COUNTERS[k] for k in actionable_keys)
+
+    # Auto-grade any ungraded drafts before queuing more (so we don't pile up unreviewed)
+    if not args.dry_run:
+        grade_counts = auto_grade_drafts(args.verbose)
+        if grade_counts.get("graded", 0) > 0:
+            log(f"  auto-grade: {grade_counts['approved']} approved, {grade_counts['rejected']} rejected, {grade_counts['escalated']} escalated")
+
+    # Always log full surface snapshot so dashboard has fresh data every tick
+    snapshot = ", ".join(f"{k}={v}" for k, v in COUNTERS.items())
+    log(f"surfaces · {snapshot}")
+
     if actionable_total == 0:
         task = proactive_work() if not args.dry_run else None
         if task:
             log(f"idle surfaces · queued proactive draft: {task} ({time.time()-started:.1f}s)")
         else:
-            log(f"idle. surfaces clear (operator_inbox={COUNTERS['operator_inbox']} audit-only). ({time.time()-started:.1f}s)")
+            log(f"idle. surfaces clear ({time.time()-started:.1f}s)")
         return
 
     # We have work. Log it, then dispatch.

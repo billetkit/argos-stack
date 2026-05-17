@@ -120,22 +120,20 @@ def kpi_state():
 
 
 def surfaces_state():
-    """Last-tick counts per surface, from heartbeat log."""
+    """Last-tick counts per surface, from heartbeat log.
+    Heartbeat logs `surfaces · k1=v1, k2=v2, ...` every tick."""
     if not HEARTBEAT_LOG.exists():
         return {}
     lines = HEARTBEAT_LOG.read_text().splitlines()
-    # Look for the most recent "work found:" line or default to all-zero
     for l in reversed(lines):
-        if "work found:" in l:
-            # Parse "work found: clawmart_inbox=0, bluesky_mentions=2, ..."
+        if "surfaces ·" in l or "surfaces:" in l or "work found:" in l:
+            sep = "surfaces ·" if "surfaces ·" in l else ("surfaces:" if "surfaces:" in l else "work found:")
             try:
-                payload = l.split("work found:", 1)[1].strip()
+                payload = l.split(sep, 1)[1].strip()
                 parts = [p.strip() for p in payload.split(",")]
                 return {k.strip(): int(v.strip()) for k, v in (p.split("=") for p in parts)}
             except Exception:
                 pass
-        if "idle. all surfaces clear" in l:
-            return {"clawmart_inbox": 0, "bluesky_mentions": 0, "bluesky_reply_queue": 0, "stripe_new_sales": 0, "intents_pending": 0}
     return {}
 
 
@@ -348,7 +346,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .col-6 { grid-column: span 6; }
   .col-8 { grid-column: span 8; }
   .col-12 { grid-column: span 12; }
-  .surfaces-list { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+  .surfaces-list { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
   .surface-item { background: var(--bg); border: 1px solid var(--border); padding: 14px 16px; border-radius: 3px; transition: border-color 0.2s; }
   .surface-item:hover { border-color: var(--border-glow); }
   .surface-item.has-work { border-color: var(--amber); box-shadow: 0 0 16px rgba(255,170,0,0.15); }
@@ -490,11 +488,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="card col-12">
       <div class="card-title">SURFACES · LAST TICK</div>
       <div class="surfaces-list" id="surfaces">
-        <div class="surface-item"><div class="surface-name">OPERATOR INBOX</div><div class="surface-count zero" id="surf-operator_inbox">0</div></div>
+        <div class="surface-item"><div class="surface-name">GITHUB ★</div><div class="surface-count zero" id="surf-github_stars">0</div></div>
+        <div class="surface-item"><div class="surface-name">GITHUB ISSUES</div><div class="surface-count zero" id="surf-github_issues">0</div></div>
         <div class="surface-item"><div class="surface-name">CLAWMART INBOX</div><div class="surface-count zero" id="surf-clawmart_inbox">0</div></div>
         <div class="surface-item"><div class="surface-name">BLUESKY/X MENTIONS</div><div class="surface-count zero" id="surf-bluesky_mentions">0</div></div>
         <div class="surface-item"><div class="surface-name">REPLY QUEUE</div><div class="surface-count zero" id="surf-bluesky_reply_queue">0</div></div>
         <div class="surface-item"><div class="surface-name">STRIPE SALES</div><div class="surface-count zero" id="surf-stripe_new_sales">0</div></div>
+        <div class="surface-item"><div class="surface-name">OPERATOR INBOX</div><div class="surface-count zero" id="surf-operator_inbox">0</div></div>
         <div class="surface-item"><div class="surface-name">INTENTS</div><div class="surface-count zero" id="surf-intents_pending">0</div></div>
       </div>
     </div>
@@ -585,7 +585,7 @@ function render(state) {
   }
 
   // surfaces
-  ['operator_inbox','clawmart_inbox','bluesky_mentions','bluesky_reply_queue','stripe_new_sales','intents_pending'].forEach(k => {
+  ['github_stars','github_issues','clawmart_inbox','bluesky_mentions','bluesky_reply_queue','stripe_new_sales','operator_inbox','intents_pending'].forEach(k => {
     const el = $('surf-' + k);
     const count = state.surfaces[k] ?? 0;
     el.textContent = count;

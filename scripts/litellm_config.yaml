@@ -1,0 +1,49 @@
+# LiteLLM proxy config for billetkit
+# Routes Anthropic + Ollama through one OpenAI-compatible endpoint at localhost:4000
+# Per-key spend tracking, budget alerts, traces ready for Langfuse callback
+
+model_list:
+  # Anthropic — claude-sonnet-4-5 is the bot's primary
+  - model_name: sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: opus
+    litellm_params:
+      model: anthropic/claude-opus-4-7
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: haiku
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # Ollama — local models on the mini
+  - model_name: qwen-coder-fast
+    litellm_params:
+      model: ollama/qwen2.5-coder:32b-fast
+      api_base: http://localhost:11434
+  - model_name: qwen-72b
+    litellm_params:
+      model: ollama/qwen2.5:72b
+      api_base: http://localhost:11434
+  - model_name: deepseek-r1
+    litellm_params:
+      model: ollama/deepseek-r1:32b
+      api_base: http://localhost:11434
+
+litellm_settings:
+  drop_params: True
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/LITELLM_DATABASE_URL
+  # store_model_in_db: True   # requires Postgres; we'll enable when Langfuse brings one up
+  alerting: ["webhook"]
+  alert_types: ["spend_tracked", "budget_alerts", "outage_alerts"]
+  # Daily $ ceiling — circuit-breaker against runaway autonomous loops.
+  # If billetkit ever spirals (5-figure-Anthropic-bill failure mode in research),
+  # the proxy halts further calls until UTC midnight.
+  max_budget: 5.0           # USD per day
+  budget_duration: 24h

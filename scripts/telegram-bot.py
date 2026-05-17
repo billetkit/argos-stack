@@ -330,22 +330,60 @@ def chat_with_ollama(messages, model):
 
 
 def chat_with_anthropic(messages, api_key, system_prompt):
-    """Multi-turn API call with tool use. Returns final text response after any tool calls resolve."""
-    current = list(messages)
-    max_turns = 8
-    for turn in range(max_turns):
-        r = requests.post("https://api.anthropic.com/v1/messages", json={
-            "model": "claude-sonnet-4-5",
-            "max_tokens": 1024,
-            "system": system_prompt,
-            "tools": TOOLS,
-            "messages": current,
-        }, headers={
+    """Multi-turn API call with tool use. Returns final text response after any tool calls resolve.
+    Routes through LiteLLM proxy at localhost:4000 (Anthropic passthrough) for cost tracking +
+    Langfuse traces. Falls back to direct Anthropic if proxy is down."""
+    secrets = load_secrets()
+    use_proxy = secrets.get("BILLETKIT_USE_LITELLM", "true").lower() == "true"
+    if use_proxy:
+        endpoint = "http://localhost:4000/v1/messages"
+        master_key = secrets.get("LITELLM_MASTER_KEY", "")
+        auth_headers = {
+            "x-api-key": master_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+    else:
+        endpoint = "https://api.anthropic.com/v1/messages"
+        auth_headers = {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
-        }, timeout=120)
-        r.raise_for_status()
+        }
+
+    current = list(messages)
+    max_turns = 8
+    # Anthropic prompt caching: the system prompt is ~10K chars and stable across turns.
+    # Wrapping it with cache_control + 1h TTL means we pay full price once per hour,
+    # then 90% off on subsequent calls. Tools also cache. Big win on a chatty bot.
+    system_blocks = [
+        {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+    ]
+    for turn in range(max_turns):
+        try:
+            r = requests.post(endpoint, json={
+                "model": "sonnet" if use_proxy else "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "system": system_blocks,
+                "tools": TOOLS,
+                "messages": current,
+            }, headers=auth_headers, timeout=120)
+            r.raise_for_status()
+        except requests.exceptions.ConnectionError:
+            if use_proxy:
+                log("  ! LiteLLM proxy down — falling back to direct Anthropic for this call")
+                endpoint = "https://api.anthropic.com/v1/messages"
+                auth_headers["x-api-key"] = api_key
+                r = requests.post(endpoint, json={
+                    "model": "sonnet" if use_proxy else "claude-sonnet-4-5",
+                    "max_tokens": 1024,
+                    "system": system_prompt,
+                    "tools": TOOLS,
+                    "messages": current,
+                }, headers=auth_headers, timeout=120)
+                r.raise_for_status()
+            else:
+                raise
         response = r.json()
         content = response.get("content", [])
 

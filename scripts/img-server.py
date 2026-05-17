@@ -17,6 +17,8 @@ from flask import Flask, request, jsonify, send_file, render_template_string
 GEN_LOCK = threading.Lock()
 PIPES = {}  # model_id → pipe (lazy-loaded)
 ACTIVE_MODEL = None
+LAST_USE_TIME = 0
+IDLE_UNLOAD_SECONDS = 600  # release MPS memory after 10 min of no requests
 
 MODEL_CONFIGS = {
     "turbo": {
@@ -51,23 +53,78 @@ MODEL_CONFIGS = {
         "max_steps": 8,
         "needs_auth": True,
     },
+    "flux-dev": {
+        "hf_id": "black-forest-labs/FLUX.1-dev",
+        "label": "FLUX.1 dev · top open-source quality · 20 steps · 3-5 min/img · needs HF token",
+        "default_steps": 20,
+        "default_guidance": 3.5,
+        "max_steps": 50,
+        "needs_auth": True,
+    },
 }
 
 
-def load_model(model_key):
-    """Lazy-load a model and unload the previous one to save RAM."""
+def unload_all():
+    """Release every loaded model + try to free MPS memory back to OS."""
     global PIPES, ACTIVE_MODEL
+    import gc
+    if PIPES:
+        for k in list(PIPES.keys()):
+            del PIPES[k]
+        PIPES.clear()
+        gc.collect()
+        try:
+            import torch
+            torch.mps.empty_cache()
+            torch.mps.synchronize()
+        except Exception:
+            pass
+        print(f"[img-server] unloaded all models (idle release)", flush=True)
+    ACTIVE_MODEL = None
+
+
+def idle_watcher():
+    """Background thread: unloads idle models after IDLE_UNLOAD_SECONDS."""
+    while True:
+        time.sleep(60)
+        if PIPES and LAST_USE_TIME > 0 and (time.time() - LAST_USE_TIME) > IDLE_UNLOAD_SECONDS:
+            with GEN_LOCK:
+                # Double-check inside the lock so we don't race with an incoming request
+                if PIPES and (time.time() - LAST_USE_TIME) > IDLE_UNLOAD_SECONDS:
+                    unload_all()
+
+
+def load_model(model_key):
+    """Lazy-load a model. Unloads any previously-loaded model BEFORE loading the new one
+    (so we never hold two models in MPS memory simultaneously)."""
+    global PIPES, ACTIVE_MODEL, LAST_USE_TIME
+    LAST_USE_TIME = time.time()
     if model_key in PIPES:
         ACTIVE_MODEL = model_key
         return PIPES[model_key]
 
     import torch
+    import gc
+
+    # CRITICAL: unload ALL previously loaded models BEFORE loading new one.
+    # Previous bug: we loaded new, THEN checked unload condition that was never true.
+    if PIPES:
+        for k in list(PIPES.keys()):
+            del PIPES[k]
+        gc.collect()
+        try:
+            torch.mps.empty_cache()
+            torch.mps.synchronize()
+        except Exception:
+            pass
+        print(f"[img-server] unloaded previous model(s) before loading {model_key}", flush=True)
+
     cfg = MODEL_CONFIGS[model_key]
     print(f"[img-server] loading {cfg['hf_id']}...", flush=True)
     t0 = time.time()
 
     # Pick the right pipeline class
-    if model_key == "flux-schnell":
+    if model_key in ("flux-schnell", "flux-dev"):
         from diffusers import FluxPipeline
         pipe = FluxPipeline.from_pretrained(cfg["hf_id"], torch_dtype=torch.bfloat16)
     else:
@@ -81,17 +138,6 @@ def load_model(model_key):
 
     pipe = pipe.to("mps")
     pipe.set_progress_bar_config(disable=True)
-
-    # Unload previous to free RAM
-    if PIPES and len(PIPES) > 1:
-        for k in list(PIPES.keys()):
-            if k != model_key:
-                del PIPES[k]
-        import gc; gc.collect()
-        try:
-            torch.mps.empty_cache()
-        except Exception:
-            pass
 
     PIPES[model_key] = pipe
     ACTIVE_MODEL = model_key
@@ -107,6 +153,10 @@ def load_default_model():
 
 def main():
     load_default_model()
+
+    # Start the idle-unload watcher in the background
+    threading.Thread(target=idle_watcher, daemon=True).start()
+    print(f"[img-server] idle watcher started (unload after {IDLE_UNLOAD_SECONDS}s idle)", flush=True)
 
     app = Flask(__name__)
 
@@ -152,6 +202,8 @@ def main():
             seed = random.randint(0, 2**32 - 1)
         seed = int(seed)
 
+        global LAST_USE_TIME
+        LAST_USE_TIME = time.time()
         with GEN_LOCK:
             t0 = time.time()
             gen = torch.Generator(device="mps").manual_seed(seed)
@@ -164,7 +216,7 @@ def main():
                     "width": width,
                     "generator": gen,
                 }
-                if negative and model_key != "flux-schnell":  # FLUX schnell doesn't accept negative
+                if negative and model_key not in ("flux-schnell", "flux-dev"):  # FLUX doesn't accept negative
                     kwargs["negative_prompt"] = negative
                 image = pipe(**kwargs).images[0]
                 pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -279,7 +331,8 @@ UI_HTML = r"""<!DOCTYPE html>
         <option value="turbo">SDXL Turbo · 4 steps · ~6s · fast preview</option>
         <option value="playground" selected>Playground v2.5 · 30 steps · ~40s · best aesthetic</option>
         <option value="sdxl">SDXL Base 1.0 · 30 steps · ~30s · vanilla</option>
-        <option value="flux-schnell">FLUX schnell · 4 steps · ~30s · needs HF token</option>
+        <option value="flux-schnell">FLUX schnell · 4 steps · ~30s · gated</option>
+        <option value="flux-dev">FLUX dev · 20 steps · ~3-5min · TOP quality · gated</option>
       </select>
     </div>
 
@@ -441,6 +494,9 @@ function onModelChange() {
   } else if (model === 'sdxl') {
     $('steps').value = 30;
     $('guidance').value = 7.5;
+  } else if (model === 'flux-dev') {
+    $('steps').value = 20;
+    $('guidance').value = 3.5;
   }
 }
 

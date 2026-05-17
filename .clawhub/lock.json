@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "skills": {
+    "skill-vetting": {
+      "version": "1.1.0",
+      "installedAt": 1779001906113
+    },
+    "capability-evolver-pro": {
+      "version": "1.0.2",
+      "installedAt": 1779001940709
+    },
+    "agent-browser-clawdbot": {
+      "version": "0.1.0",
+      "installedAt": 1779001943687
+    },
+    "liang-tavily-search": {
+      "version": "1.0.1",
+      "installedAt": 1779001986077
+    },
+    "mem0-memory": {
+      "version": "1.0.0",
+      "installedAt": 1779001990216
+    },
+    "encryptedenergy-uptime": {
+      "version": "0.2.4",
+      "installedAt": 1779002908420
+    },
+    "audit-log-firewall": {
+      "version": "1.0.0",
+      "installedAt": 1779002912118
+    },
+    "openclaw-twitter": {
+      "version": "1.0.3",
+      "installedAt": 1779002928715
+    },
+    "reddit-write": {
+      "version": "1.0.0",
+      "installedAt": 1779002932195
+    },
+    "reddit-post-lab": {
+      "version": "1.0.1",
+      "installedAt": 1779002936286
+    }
+  }
+}
