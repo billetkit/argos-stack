@@ -31,6 +31,37 @@ Advanced Bluesky/AT Protocol orchestration skill. This skill allows for authenti
 - **GitHub Repository**: [https://github.com/Heather-Herbert/openclaw-bluesky](https://github.com/Heather-Herbert/openclaw-bluesky)
 - **Standard**: Follows OpenClaw AT Protocol implementation patterns.
 
+## ⚠ REQUIRED: Bot Self-Label on First Connect
+
+**Bluesky's policy requires automated accounts to self-label as `bot` via the `app.bsky.actor.profile` record.** Skipping this is one of the few documented suspension triggers for autonomous accounts (see argos research dive 05, May 2026).
+
+**Before any post/like/repost action, call `ensure_bot_self_label(client)` once after login.** The function is idempotent — safe to call every session. It:
+- Reads the current profile record (handles fresh-account "no profile yet" gracefully)
+- Checks if `labels.values[].val == "bot"` is already set; if so, skips
+- Otherwise writes the profile record with `labels.$type = com.atproto.label.defs#selfLabels` and `values = [{ val: "bot" }]`, preserving all other profile fields
+- Uses `swap_record` (CID compare-and-swap) to avoid clobbering concurrent edits
+
+```python
+from atproto import Client
+from lib.self_label import ensure_bot_self_label
+
+client = Client()
+client.login(handle, app_password)
+ensure_bot_self_label(client)   # ← MANDATORY before any write op
+# ... now safe to post/like/repost
+```
+
+CLI smoke test (reads `ARGOS_V2_BSKY_HANDLE` + `ARGOS_V2_BSKY_APP_PASSWORD` from env):
+```
+python3 lib/self_label.py
+```
+
+**Why this matters:** Bluesky moderation surfaces bot accounts in client UIs based on this self-label. Unlabeled automation is treated as deceptive. The label persists on the profile record — you only need to set it once, but call the helper on every session boot to recover from any profile-update path that overwrites the labels field.
+
+Spec sources:
+- https://docs.bsky.app/docs/starter-templates/bots (canonical)
+- https://github.com/bluesky-social/atproto/blob/main/lexicons/app/bsky/actor/profile.json
+
 ## Configuration & Authentication
 This skill expects the following environment variables to be set for secure operation:
 
@@ -44,6 +75,7 @@ This skill expects the following environment variables to be set for secure oper
 3. **Environment Variables**: Configure your shell or `OPENCLAW_ENV` to include the variables listed above. Do not store your primary account password here.
 
 ## Capabilities
+- `ensure_bot_self_label(client, label_value="bot")`: **REQUIRED before any write op.** Idempotently writes the bot self-label to the profile record. See section above.
 - `post(text, { reply_to, embed, facets })`: Create new posts. Threading requires `root` and `parent` references (`uri`+`cid`).
 - `like(uri, cid)`: Like content.
 - `repost(uri, cid)`: Repost content.
