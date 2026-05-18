@@ -1,48 +1,21 @@
 {
-  "name": "io.github.billetkit/billetkit-voice-grader",
-  "description": "AI-slop detection + 2026 anti-tell voice grading. Drop in front of any LLM that produces customer-facing prose. Two tools: ai_slop_score (Pangram/GPTZero simulator) and voice_grade (strict anti-tell rubric).",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.billetkit/voice-grader",
+  "description": "MCP server that detects AI slop in text using voice-based heuristics. Catches generic phrasing, corporate jargon, and telltale patterns from LLM output.",
   "repository": {
     "url": "https://github.com/billetkit/argos-stack",
-    "source": "github",
-    "subfolder": "packages/billetkit-voice-grader"
+    "source": "github"
   },
-  "version_detail": {
-    "version": "0.1.0",
-    "release_date": "2026-05-18"
-  },
+  "version": "0.1.0",
   "packages": [
     {
-      "registry_name": "pypi",
-      "name": "billetkit-voice-grader",
+      "registryType": "pypi",
+      "identifier": "billetkit-voice-grader",
       "version": "0.1.0",
-      "package_arguments": [],
-      "environment_variables": [
-        {
-          "name": "ANTHROPIC_API_KEY",
-          "description": "Anthropic API key for Haiku-class inference. Either this or OLLAMA_BASE_URL is required."
-        },
-        {
-          "name": "OLLAMA_BASE_URL",
-          "description": "URL of local Ollama (e.g. http://localhost:11434). Alternative to ANTHROPIC_API_KEY for free local inference."
-        },
-        {
-          "name": "ANTHROPIC_MODEL",
-          "description": "Optional. Default claude-haiku-4-5."
-        },
-        {
-          "name": "OLLAMA_MODEL",
-          "description": "Optional. Default qwen2.5-coder:32b."
-        }
-      ]
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": []
     }
-  ],
-  "tags": [
-    "ai-detection",
-    "voice-grader",
-    "content-quality",
-    "pangram",
-    "gptzero",
-    "ai-slop",
-    "publish-gate"
   ]
 }
