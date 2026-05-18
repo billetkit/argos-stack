@@ -255,6 +255,41 @@ def default_billetkit_servers(secrets: dict) -> dict[str, StdioServerParameters]
             args=["-y", "@stripe/mcp", f"--api-key={stripe_key}"],
         )
 
+    # Context7 — version-pinned package docs (Upstash, no creds required for free tier).
+    # Must-have for any code-touching path. Injects real, up-to-date docs into agent context.
+    if secrets.get("BILLETKIT_DISABLE_CONTEXT7", "").lower() != "true":
+        servers["context7"] = StdioServerParameters(
+            command="npx",
+            args=["-y", "@upstash/context7-mcp"],
+        )
+
+    # GitHub MCP (official) — code search, issues, PRs, commits.
+    # Uses BILLETKIT_GITHUB_PAT for authentication. Scope: repo:read (and write
+    # if you want PR/issue automation — current PAT scope depends on what was generated).
+    gh_pat = secrets.get("BILLETKIT_GITHUB_PAT") or secrets.get("GITHUB_PERSONAL_ACCESS_TOKEN")
+    if gh_pat:
+        servers["gh"] = StdioServerParameters(
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-github"],
+            env={"GITHUB_PERSONAL_ACCESS_TOKEN": gh_pat},
+        )
+
+    # Playwright MCP — browser automation as MCP tools. Different from our direct
+    # Playwright Python (which we use for posters); this one lets Claude DRIVE
+    # browsers via tool_use during conversation, eg "open the article and summarize it".
+    if secrets.get("BILLETKIT_DISABLE_PLAYWRIGHT_MCP", "").lower() != "true":
+        servers["browser"] = StdioServerParameters(
+            command="npx",
+            args=["-y", "@playwright/mcp", "--isolated"],  # isolated = ephemeral session
+        )
+
+    # Sequential thinking — structured reasoning helper, useful for plan-then-act flows.
+    if secrets.get("BILLETKIT_DISABLE_SEQTHINK", "").lower() != "true":
+        servers["think"] = StdioServerParameters(
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-sequential-thinking"],
+        )
+
     return servers
 
 
